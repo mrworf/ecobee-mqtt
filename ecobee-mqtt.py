@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 #
 #
+import sys
 import shelve
 from datetime import datetime
 import pytz
@@ -28,10 +29,10 @@ class EcobeePoller:
       pyecobee_db.close()
 
     if not self.service.authorization_token:
-      authorize(self.service)
+      self.authorize()
 
     if not self.service.access_token:
-      request_tokens(self.service)
+      self.request_tokens()
 
   def persist_to_shelf(self, file_name):
     pyecobee_db = shelve.open(file_name, protocol=2)
@@ -41,44 +42,55 @@ class EcobeePoller:
 
   def refresh_tokens(self):
     token_response = self.service.refresh_tokens()
-    logging.debug('TokenResponse returned from self.service.refresh_tokens():\n{0}'.format(
-      token_response.pretty_format()))
+    #logging.debug('TokenResponse returned from self.service.refresh_tokens():\n{0}'.format(token_response.pretty_format()))
 
-    persist_to_shelf('pyecobee_db', self.service)
+    self.persist_to_shelf('pyecobee_db')
 
 
   def request_tokens(self):
     token_response = self.service.request_tokens()
-    logging.debug('TokenResponse returned from self.service.request_tokens():\n{0}'.format(
-      token_response.pretty_format()))
+    #logging.debug('TokenResponse returned from self.service.request_tokens():\n{0}'.format(token_response.pretty_format()))
 
-    persist_to_shelf('pyecobee_db', self.service)
+    self.persist_to_shelf('pyecobee_db')
 
 
   def authorize(self):
     authorize_response = self.service.authorize()
-    logging.debug('AutorizeResponse returned from self.service.authorize():\n{0}'.format(
-      authorize_response.pretty_format()))
+    #logging.debug('AutorizeResponse returned from authorize():\n{0}'.format(authorize_response.pretty_format()))
 
-    persist_to_shelf('pyecobee_db', self.service)
+    self.persist_to_shelf('pyecobee_db')
 
-    logging.info('Please add EcobeeMQTT as an application. Enter PIN "{0}" on the My Apps page')
+    logging.info('Please add EcobeeMQTT as an application. Enter PIN "%s" on the My Apps page', authorize_response.ecobee_pin)
     logging.info('Rerun EcobeeMQTT once completed.')
     sys.exit(1)
 
   def update_tokens(self):
     now_utc = datetime.now(pytz.utc)
     if now_utc > self.service.refresh_token_expires_on:
-      authorize(self.service)
-      request_tokens(self.service)
+      logging.warning('Refresh token expired, reauthorizing')
+      self.authorize()
+      self.request_tokens()
     elif now_utc > self.service.access_token_expires_on:
-      token_response = self.service.refresh_tokens()
+      logging.debug('Access token expired, refreshing')
+      token_response = self.refresh_tokens()
 
   def poll_thermostat(self):
-    thermostat_summary_response = self.service.request_thermostats_summary(selection=Selection(
-            selection_type=SelectionType.REGISTERED.value,
-            selection_match='',
-            include_equipment_status=True))
+    thermostat_summary_response = None
+    try:
+      thermostat_summary_response = self.service.request_thermostats_summary(selection=Selection(
+      selection_type=SelectionType.REGISTERED.value,
+      selection_match='',
+      include_equipment_status=True))
+    except EcobeeApiException as e:
+      if e.status_code == 14:
+        token_response = self.refresh_tokens()
+        thermostat_summary_response = self.service.request_thermostats_summary(selection=Selection(
+        selection_type=SelectionType.REGISTERED.value,
+        selection_match='',
+        include_equipment_status=True))
+
+    if thermostat_summary_response is None:
+      return {}
 
     # Figure out the status of the thermostat
     result = {}
@@ -128,9 +140,15 @@ class Reporter(threading.Thread):
     ]
 
     current_state = {}
+    logging.info('Started reporter')
     while True:
-      ecobee.update_tokens()
-      change = ecobee.poll_thermostat()
+      change = {}
+      try:
+        ecobee.update_tokens()
+        change = ecobee.poll_thermostat()
+      except:
+        logging.exception('Failed to poll ecobee api')
+      logging.info('Polling result: ' + repr(change))
 
       # First, remember old state
       old_state = current_state
@@ -153,6 +171,7 @@ class Reporter(threading.Thread):
           if state not in old_state[thermo] or old_state[thermo][state] != current_state[thermo][state]:
             logging.info('Termostate %s changed state %s to %d', thermo, state, current_state[thermo][state])
 
+      logging.info('Raw state: %s', repr(current_state))
       time.sleep(180) # 3min due to limitations of ecobee API
 
 if __name__ == '__main__':
